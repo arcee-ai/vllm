@@ -116,6 +116,7 @@ class ExpertLinear(nn.Module):
     def forward(self, x):
         x = x.to(self.dtype)
         linear_output = self.linear(x)
+        print("DEBUG Print:", linear_output.shape)
         expert_outputs = linear_output.unsqueeze(2).expand(-1, -1, self.num_experts, -1)
         expert_outputs = expert_outputs * self.scaling_parameters.view(1, 1, self.num_experts, 1)
         gate_output = self.gate(linear_output)
