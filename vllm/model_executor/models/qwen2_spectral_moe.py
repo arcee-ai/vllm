@@ -29,6 +29,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from transformers import Qwen2Config
+from transformers.activations import ACT2FN
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils._errors import RepositoryNotFoundError
 
@@ -116,18 +117,30 @@ class ExpertLinear(nn.Module):
     def forward(self, x):
         x = x.to(self.dtype)
         linear_output = self.linear(x)
-        print("DEBUG Print:", linear_output.shape)
+
+        # Add a dummy batch dimension
+        linear_output = linear_output.unsqueeze(0)
+
         expert_outputs = linear_output.unsqueeze(2).expand(-1, -1, self.num_experts, -1)
         expert_outputs = expert_outputs * self.scaling_parameters.view(1, 1, self.num_experts, 1)
+
         gate_output = self.gate(linear_output)
         gate_output = torch.sigmoid(gate_output)
+
         gated_expert_outputs = expert_outputs * gate_output.unsqueeze(-1)
         gate_count = gate_output.sum(dim=2, keepdim=True)
         gate_count = gate_count.where(gate_count > 0, torch.tensor(1.0, device=gate_count.device, dtype=self.dtype))
+
         averaged_expert_output = gated_expert_outputs.sum(dim=2) / gate_count
-        router_output = self.router(x)
+
+        router_output = self.router(x.unsqueeze(0))  # Add dummy batch dim for router
         router_output = torch.sigmoid(router_output)
+
         combined_output = router_output * averaged_expert_output + (1 - router_output) * linear_output
+
+        # Remove the dummy batch dimension
+        combined_output = combined_output.squeeze(0)
+
         return combined_output
 
 
@@ -147,7 +160,8 @@ class Qwen2MLP(nn.Module):
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+        self.act_fn = ACT2FN[hidden_act]
+
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -277,6 +291,7 @@ class Qwen2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -330,6 +345,7 @@ class Qwen2Model(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
+
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -391,9 +407,7 @@ class Qwen2SpectralMoEForCausalLM(nn.Module, SupportsLoRA):
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = ParallelLMHead(config.vocab_size,
-                                          config.hidden_size,
-                                          quant_config=quant_config)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
@@ -456,6 +470,7 @@ class Qwen2SpectralMoEForCausalLM(nn.Module, SupportsLoRA):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
+
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
         return hidden_states
