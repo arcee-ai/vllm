@@ -350,10 +350,6 @@ class Qwen2SpectralMoEForCausalLM(nn.Module, SupportsLoRA):
             "k_proj",
             "v_proj",
         ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
     }
 
     # LoRA specific attributes
