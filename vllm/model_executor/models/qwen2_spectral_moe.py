@@ -129,7 +129,9 @@ class ExpertLinear(nn.Module):
 
         gated_expert_outputs = expert_outputs * gate_output.unsqueeze(-1)
         gate_count = gate_output.sum(dim=2, keepdim=True)
-        gate_count = gate_count.where(gate_count > 0, torch.tensor(1.0, device=gate_count.device, dtype=self.dtype))
+
+        # Use a stream-safe operation to handle zero values
+        gate_count = gate_count + (gate_count == 0).to(self.dtype)
 
         averaged_expert_output = gated_expert_outputs.sum(dim=2) / gate_count
 
@@ -242,6 +244,22 @@ class Qwen2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+# Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen2
+# class RMSNorm(nn.Module):
+#     def __init__(self, hidden_size, eps=1e-6):
+#         """
+#         Qwen2RMSNorm is equivalent to T5LayerNorm
+#         """
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(hidden_size))
+#         self.variance_epsilon = eps
+
+#     def forward(self, hidden_states):
+#         input_dtype = hidden_states.dtype
+#         hidden_states = hidden_states.to(torch.float32)
+#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+#         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+#         return self.weight * hidden_states.to(input_dtype)
 
 class Qwen2DecoderLayer(nn.Module):
 
