@@ -403,8 +403,8 @@ class Qwen2SpectralMoEForCausalLM(nn.Module, SupportsLoRA):
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
 
-        def get_input_embeddings(self):
-            return self.model.embed_tokens
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
@@ -485,8 +485,6 @@ class Qwen2SpectralMoEForCausalLM(nn.Module, SupportsLoRA):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
