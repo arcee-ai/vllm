@@ -23,10 +23,15 @@
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 from typing import Iterable, List, Optional, Tuple
+import os
+from pathlib import Path
 
 import torch
 from torch import nn
 from transformers import Qwen2Config
+from transformers.activations import ACT2FN
+from huggingface_hub import snapshot_download
+from huggingface_hub.utils._errors import RepositoryNotFoundError
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
@@ -50,6 +55,94 @@ from vllm.sequence import IntermediateTensors, SamplerOutput
 
 from .interfaces import SupportsLoRA
 
+class ModelNotFoundError(Exception):
+    def __init__(self, message):
+        self.message = message
+        super().__init__(self.message)
+
+
+def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+    """
+    Ensures the model is available locally. If the path does not exist locally,
+    it is downloaded from the Hugging Face Hub.
+    Args:
+        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
+        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+    Returns:
+        Path: The path to the model.
+    """
+    model_path = Path(path_or_hf_repo)
+    if not model_path.exists():
+        try:
+            model_path = Path(
+                snapshot_download(
+                    repo_id=path_or_hf_repo,
+                    revision=revision,
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.py",
+                        "tokenizer.model",
+                        "*.tiktoken",
+                        "*.txt",
+                    ],
+                )
+            )
+        except RepositoryNotFoundError:
+            raise ModelNotFoundError(
+                f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
+                "Please make sure you specified the local path or Hugging Face"
+                " repo id correctly.\nIf you are trying to access a private or"
+                " gated Hugging Face repo, make sure you are authenticated:\n"
+                "https://huggingface.co/docs/huggingface_hub/en/guides/cli#huggingface-cli-login"
+            ) from None
+    return model_path
+
+class ExpertLinear(nn.Module):
+    def __init__(self, module, num_experts=8, freeze_linear=True, dtype=None):
+        super(ExpertLinear, self).__init__()
+        self.in_features, self.out_features = module.in_features, module.out_features
+        self.num_experts = num_experts
+        self.dtype = dtype or module.weight.dtype
+
+        self.linear = nn.Linear(self.in_features, self.out_features, bias=False, dtype=self.dtype)
+        self.linear.weight = nn.Parameter(module.weight.clone().detach().to(self.dtype))
+        self.scaling_parameters = nn.Parameter(torch.rand(num_experts, dtype=self.dtype))
+        self.router = nn.Linear(self.in_features, 1, dtype=self.dtype)
+        self.gate = nn.Linear(self.out_features, num_experts, dtype=self.dtype)
+
+        if freeze_linear:
+            self.linear.weight.requires_grad = False
+
+    def forward(self, x):
+        x = x.to(self.dtype)
+        linear_output = self.linear(x)
+
+        # Add a dummy batch dimension
+        linear_output = linear_output.unsqueeze(0)
+
+        expert_outputs = linear_output.unsqueeze(2).expand(-1, -1, self.num_experts, -1)
+        expert_outputs = expert_outputs * self.scaling_parameters.view(1, 1, self.num_experts, 1)
+
+        gate_output = self.gate(linear_output)
+        gate_output = torch.sigmoid(gate_output)
+
+        gated_expert_outputs = expert_outputs * gate_output.unsqueeze(-1)
+        gate_count = gate_output.sum(dim=2, keepdim=True)
+        gate_count = gate_count.where(gate_count > 0, torch.tensor(1.0, device=gate_count.device, dtype=self.dtype))
+
+        averaged_expert_output = gated_expert_outputs.sum(dim=2) / gate_count
+
+        router_output = self.router(x.unsqueeze(0))  # Add dummy batch dim for router
+        router_output = torch.sigmoid(router_output)
+
+        combined_output = router_output * averaged_expert_output + (1 - router_output) * linear_output
+
+        # Remove the dummy batch dimension
+        combined_output = combined_output.squeeze(0)
+
+        return combined_output
+
 
 class Qwen2MLP(nn.Module):
 
@@ -61,25 +154,17 @@ class Qwen2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config)
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           quant_config=quant_config)
+        self.gate_proj = ExpertLinear(nn.Linear(hidden_size, intermediate_size, bias=False))
+        self.up_proj = ExpertLinear(nn.Linear(hidden_size, intermediate_size, bias=False))
+        self.down_proj = ExpertLinear(nn.Linear(intermediate_size, hidden_size, bias=False))
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+        self.act_fn = ACT2FN[hidden_act]
+
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class Qwen2Attention(nn.Module):
 
@@ -206,6 +291,7 @@ class Qwen2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -259,6 +345,7 @@ class Qwen2Model(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
+
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -273,16 +360,12 @@ class Qwen2Model(nn.Module):
         return hidden_states
 
 
-class Qwen2ForCausalLM(nn.Module, SupportsLoRA):
+class Qwen2SpectralMoEForCausalLM(nn.Module, SupportsLoRA):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
             "k_proj",
             "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
         ],
     }
 
@@ -290,8 +373,6 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA):
     supported_lora_modules = [
         "qkv_proj",
         "o_proj",
-        "gate_up_proj",
-        "down_proj",
     ]
     embedding_modules = {}
     embedding_padding_modules = []
@@ -326,12 +407,60 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA):
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = ParallelLMHead(config.vocab_size,
-                                          config.hidden_size,
-                                          quant_config=quant_config)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = Sampler()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    @classmethod
+    def update_model(cls, model, dtype=None):
+        for name, module in model.named_modules():
+            if "mlp" in name:
+                if isinstance(module, nn.Linear):
+                    expert_linear = ExpertLinear(module, dtype=dtype)
+                    parent_name, child_name = name.rsplit('.', 1)
+                    parent_module = dict(model.named_modules())[parent_name]
+                    setattr(parent_module, child_name, expert_linear)
+                    del module
+        return model
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        # Check if SpectralMoE checkpoint exists
+        model_path = get_model_path(pretrained_model_name_or_path)
+        safetensor_files = [f for f in os.listdir(model_path) if f.endswith(".safetensors")]
+
+        if safetensor_files:
+            print("SpectralMoE checkpoint(s) detected...")
+            kwargs['_from_auto'] = True
+        else:
+            pytorch_model_file = os.path.join(model_path, "pytorch_model.bin")
+            if not os.path.exists(pytorch_model_file):
+                print("Converting to SpectralMoE...")
+                kwargs['_from_auto'] = True
+
+        # Call the parent class's from_pretrained method
+        model = super().from_pretrained(model_path, *model_args, **kwargs)
+
+        return model
 
     def forward(
         self,
@@ -341,6 +470,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA):
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> torch.Tensor:
+
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata)
         return hidden_states
@@ -365,8 +495,6 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
