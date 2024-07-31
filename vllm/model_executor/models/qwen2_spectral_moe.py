@@ -25,6 +25,8 @@
 from typing import Iterable, List, Optional, Tuple
 import os
 from pathlib import Path
+import numpy as np
+
 
 import torch
 from torch import nn
@@ -130,8 +132,10 @@ class ExpertLinear(nn.Module):
         gated_expert_outputs = expert_outputs * gate_output.unsqueeze(-1)
         gate_count = gate_output.sum(dim=2, keepdim=True)
 
-        # Use a stream-safe operation to handle zero values
-        gate_count = gate_count + (gate_count == 0).to(self.dtype)
+        # Convert to numpy, perform the operation, and convert back to PyTorch
+        gate_count_np = gate_count.detach().cpu().numpy()
+        gate_count_np = np.where(gate_count_np > 0, gate_count_np, 1.0)
+        gate_count = torch.from_numpy(gate_count_np).to(device=x.device, dtype=self.dtype)
 
         averaged_expert_output = gated_expert_outputs.sum(dim=2) / gate_count
 
